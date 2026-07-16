@@ -1,0 +1,9 @@
+# Node / TypeScript
+node_modules/
+dist/
+
+# Secrets and local config
+.env
+
+# Misc
+*.log

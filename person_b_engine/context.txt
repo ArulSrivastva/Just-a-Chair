@@ -1,0 +1,848 @@
+Understood — full stack, real deployment, no shortcuts. The key to making this actually work in 4 hours is: **deploy an empty skeleton in the first 20 minutes**, then every piece gets pushed and deployed continuously as it's built. That way "deployment" isn't a cliff at 3:50 — it's already been live and working the whole time, just getting features added to it.
+
+## Why this is feasible in 4 hours
+
+Supabase and Upstash are both managed services with near-zero setup — you're not standing up Postgres or Redis yourself, you're copying a URL and a key from a dashboard. That's what makes keeping the full stack realistic here.
+
+## First 20 minutes — all three together
+
+1. Create accounts: Supabase project, Upstash Redis database, Groq API key, Mistral API key, Vercel project (frontend), Render/Fly project (backend)
+2. Write the contract file (schemas, tool JSON, WS events — same as before)
+3. Push an empty Express "hello world" + Next.js skeleton to git, connect both to Render and Vercel, confirm auto-deploy on push works
+4. Paste the full Postgres schema from the architecture doc straight into Supabase's SQL editor and run it — schema is live in under 2 minutes
+
+From this point, **every commit deploys automatically** — integration happens continuously, not at the end.
+
+## Hour-by-hour split
+
+| Time | Person A — backend + realtime | Person B — negotiation engine | Person C — orchestration + infra |
+|---|---|---|---|
+| **0:20–1:15** | Express routes (real Supabase client, not stubs), Socket.io gateway, push to Render repeatedly as routes come online | Standalone script calling Groq with the `submit_bids` tool schema, tested locally against fake JSON — no server dependency yet | Upstash Redis connected via REST client, write the debounce key logic and the seed data script (individual + mass scenarios) directly as SQL inserts into Supabase |
+| **1:15–2:15** | Wire WS broadcasts to fire on any Supabase row change (or on explicit emit from the orchestrator, simpler for MVP); deploy continuously | Wrap Groq calls into `runNegotiationRound()`, add the dependency check step, add the Mistral explanation call at the end of the function | Build the scheduler (individual = one call, mass = interval loop), pointed at real Supabase reads — test against the seeded data directly, independent of Person A's routes |
+| **2:15–3:00** | **Integration 1**: Person C's scheduler calls Person B's `runNegotiationRound()`, writes results via Person A's DB layer, Person A's server broadcasts over WS. Push to Render immediately. | Available to debug prompt reliability/latency issues live during integration | Same — pair with A on wiring, watch Upstash debounce behavior under real load |
+| **3:00–3:30** | Full loop running on the **deployed** Render instance, not localhost — this matters, test the real thing | Tune agent prompts if bids are inconsistent or slow | Confirm mass-event loop behaves correctly on deployed infra (Upstash timing can differ slightly from local) |
+| **3:30–3:50** | Frontend person connects to the real deployed WS + REST endpoints (Vercel → Render), not a mock — this is the actual integration moment for them | Have 1–2 backup pre-recorded Groq/Mistral responses ready in case of live API hiccup during judging | Run both demo scenarios end-to-end on the deployed URLs, watch Supabase/Upstash dashboards for errors |
+| **3:50–4:00** | All: final smoke test on the live deployed URL, fix anything on fire, confirm audit log renders | | |
+
+## What makes this safe to attempt rather than reckless
+
+- **Deploying early and often** means you find Render/Vercel config issues (env vars, CORS, WS proxying) at minute 30 when they're a 5-minute fix, not at minute 230 when they're a crisis.
+- **Person B's negotiation engine is a pure function** the whole time — it doesn't touch Supabase, Redis, or Express directly, so it never blocks and never gets blocked.
+- **The single riskiest wire** is Socket.io through Render to Vercel (WebSocket proxying across two different hosts can be fiddly) — get one dummy event flowing end-to-end in the first hour as a spike, even before real logic exists, so you know the transport works before you're relying on it under time pressure.
+
+## One honest risk to flag to your team now
+
+Real deployment across four services (Supabase, Upstash, Render, Vercel) plus two LLM providers means more places for something to go wrong than the in-memory version — mainly around environment variables and CORS/WebSocket config between hosts. Budget the WS transport spike in hour 1 specifically to de-risk that, since it's the one piece that's genuinely different between "runs on my machine" and "runs deployed."
+
+Want me to write out the exact env variable list and the Socket.io + Render + Vercel CORS/WS config now, so Person A can paste it in directly instead of debugging it live?
+
+
+You're right — the doc explains the *system* well but doesn't explain each *person's job* as something they could read cold and just start doing. Here's that, written as three standalone briefs. Each one should make sense on its own, with no prior context needed.
+
+---
+
+## If you are Person A: read only this
+
+**Your job in one sentence:** you're the librarian. You store information and you have a phone line open that rings the moment something new comes in, so anyone listening hears about it right away.
+
+**What you are NOT doing:** you don't decide when a negotiation happens (that's Person C's job) and you don't decide who wins a bid or why (that's Person B's job). You just move data in and out, and notify people when it changes.
+
+**Concretely, you build three things:**
+1. **A place to store and fetch data** — patients waiting, resources available, past decisions. This is just a database (Supabase) with some functions on top like "give me the current list of patients" and "save this decision."
+2. **A "please tell me when something changes" line** — instead of the browser asking "anything new?" every second, you keep a connection open and push updates the instant they happen. This is called SSE (Server-Sent Events) — think of it as a live phone line rather than someone repeatedly calling to check.
+3. **Normal web routes** — the basic in/out doors of the app (declare an emergency, add a patient, look at a resource).
+
+**What you receive from Person C:** nothing code-wise — Person C calls *your* functions, you never wait on them.
+
+**What you hand to Person C:** three functions with fixed names, so they know exactly what to call:
+- "give me current data" 
+- "save this decision"
+- "tell everyone listening that something happened"
+
+**Your personal timeline:**
+- First 25 min: build these three functions with made-up fake data inside them (not real yet) — just so the shapes exist and Person C can start using them immediately.
+- Next hour: replace the fake data with real database calls, and build the live phone line (SSE).
+- Next 45 min: make sure a test message actually flows all the way from your server to a browser — this is the trickiest wire in the whole project, so prove it works early.
+- Last 90 min: swap in for real once Person C is ready to connect everything, then help test the whole thing live once it's deployed.
+
+---
+
+## If you are Person B: read only this
+
+**Your job in one sentence:** you're the brain. Someone hands you a list of waiting patients and a list of available resources, and you hand back a decision: who gets what, and a plain-English reason why.
+
+**What you are NOT doing:** you never touch the database, never touch the website, never worry about *when* things happen or how often. You just answer the question "given this situation, what should happen?" — once, when asked.
+
+**Concretely, you build one function.** It does this internally:
+1. For each type of resource (ICU bed, OR slot, staff, equipment), ask an AI model (Groq) "would you take this patient, and why? give it a score."
+2. Check that the bid doesn't break a real-world rule — e.g. you can't assign an operating room if there's no available surgeon.
+3. When two resources both want the same patient, pick the higher score.
+4. Ask a second AI model (Mistral) to write a short, human-readable explanation of the overall decision.
+5. Hand back the final decision plus that explanation.
+
+**The most important thing about your job:** you can build and fully test this entirely alone, on your own laptop, using made-up fake patients and fake resources. You never have to wait for anyone else to finish anything.
+
+**What you receive from anyone:** a list of patients and resources (in a fixed, agreed format).
+
+**What you hand off:** your one function, which Person C will call.
+
+**Your personal timeline:**
+- First 25 min: write your function with a fake, hardcoded answer inside (not calling any AI yet) — just to confirm it has the right shape.
+- Next hour: make it actually call Groq for real bids and check the real-world rules.
+- Next 45 min: add the final step that calls Mistral to write the explanation. Test the whole thing standalone with fake data — no server needed at all.
+- Last 90 min: help Person C plug your real function in, then help tune it live if the AI responses are slow or inconsistent, and prepare a backup pre-saved answer in case the AI service hiccups during the actual demo.
+
+---
+
+## If you are Person C: read only this
+
+**Your job in one sentence:** you're the conductor. You decide *when* to ask the brain (Person B) for a decision, using the current data (from Person A), and you make sure the result gets saved and announced (also through Person A). You never write the librarian's code or the brain's code — you just call them, like using a tool.
+
+**What you are NOT doing:** you don't write any database code and you don't write any AI-calling code. You call Person A's functions and Person B's function, and everything else — the timing, the repetition, the account setup — is yours.
+
+**Concretely, you build:**
+1. **The glue** — a small piece of code that does, in order: ask Person A for the current data → hand it to Person B → get the decision back → ask Person A to save it and announce it.
+2. **The timing rule** — if it's a single urgent patient, do the above once and you're done. If it's a mass emergency with many patients arriving over time, keep repeating it every couple of seconds until things settle down. You use a tool called Redis to keep track of "did I just do this a second ago?" so you don't repeat too fast.
+3. **Getting everyone's accounts set up** — the database, the Redis timing tool, the two AI services, and the actual deployed hosting. Think of yourself as also doing "IT setup" for the team.
+
+**What you receive from Person A and Person B:** their three-plus-one functions, by name, agreed in the first 20 minutes.
+
+**What you hand off:** nothing code-wise to them — you're the one calling their code, not the other way around.
+
+**Your personal timeline:**
+- First 25 min: write your glue code calling **fake stand-in versions** of Person A's and Person B's functions, just to prove your logic works before either of them is done.
+- Next hour: set up Redis and write the actual timing/repetition rule, still testing against fake results.
+- Next 45 min: point your timing rule at the real Redis service, still using fake decision results for now.
+- Last 90 min: swap in Person A's real functions and Person B's real function, one at a time. Then help test both scenarios (single patient, mass event) on the actual deployed website, watching the dashboards for errors.
+
+---
+
+Want me to fold these three self-contained briefs directly into the printable doc, so it's literally three tear-off sections one per person, followed by the shared reference material (schema, contract, etc.) at the end?
+
+
+The interconnected workflow: develop, test, merge, deploy
+
+This is the cycle all three of you repeat as each real function comes online. It's the
+part that actually makes three people's separate work become one deployed system —
+read this section together as a team, not just individually.
+
+All three of you work in one shared git branch, in one repo, deploying as one Render
+service. There is no separate integration step at the end — integration happens
+continuously, in small cycles, throughout the build.
+
+The cycle, step by step
+
+
+Build against stubs first (first ~25 minutes). Before any real code exists,
+whoever depends on someone else's function writes a fake version of it with the
+same name and same return shape. This lets everyone start immediately with nothing
+blocking anyone.
+Each person builds and tests their real function alone.
+
+Person A tests real loadState/saveResult/broadcast by hitting Express
+routes directly (curl/Postman) and checking rows appear in Supabase.
+Person B tests runNegotiationRound with a standalone script and hardcoded
+arrays — no server needed at all.
+Person C tests the scheduler against the Step 1 stubs.
+
+
+
+Announce and push the moment a real function works. Don't batch up changes or
+wait for a "clean" moment — push small, working pieces continuously to the shared
+branch as soon as each one is verified.
+Whoever was using a stub swaps to the real import. This should be a one-line
+change (from './x.stub' → from './x') with the stub file deleted. If it's not a
+one-line change, the function's name or return shape drifted from what was agreed —
+fix that first before anything else.
+Run the whole thing together, locally, on one machine. All three people watch
+one terminal. Manually walk the full flow: declare an emergency, add a case, confirm
+in the logs that the scheduler fired, the negotiation engine returned a real
+decision, and the SSE broadcast actually sent an event. This is the step most likely
+to get skipped under time pressure — don't skip it. It's where bugs are cheapest to
+find.
+Push to the branch Render watches; it auto-deploys. This only works smoothly if
+Render's auto-deploy was already wired up against an empty skeleton in the first 20
+minutes, before any real logic existed.
+Smoke test on the deployed URL, not just locally. Repeat the exact same manual
+walkthrough from step 5, but against the live Render URL. Environment variables,
+Supabase network rules, and SSE connection behavior can all differ once actually
+deployed — catch this with time left to fix it, not during judging.
+Repeat steps 2–7 for each remaining real function. You'll cycle through this
+multiple times — once per person's real implementation landing. Each pass should be
+faster since the wiring between functions is already proven; you're only swapping in
+one more real piece at a time.
+
+
+Git logistics for this cycle
+
+
+One shared branch (e.g. main), not long-lived separate feature branches — with a
+4-hour timeline, long-lived branches create merge conflicts you don't have time to
+resolve.
+Push small and often. A push that only changes one function's internals (with the
+same name/signature) is very unlikely to conflict with anyone else's work.
+Say out loud (chat or voice) the moment something real is pushed — "real loadState
+is up" — so the other two know to swap their stub immediately rather than finding out
+later.
+
+
+What "done" looks like at each checkpoint
+
+
+After the first stub cycle: the whole flow runs end-to-end with fake data, on one
+machine, and everyone has seen it work once.
+After each real-function swap: the same flow runs end-to-end, this time with one
+more piece being real instead of fake, verified locally and then on the deployed URL.
+After the last swap: the entire flow is real, deployed, and has been manually
+walked through at least twice (once for the individual-patient scenario, once for the
+mass-casualty scenario) on the actual Render URL before anyone considers it finished.
+
+
+Mostly correct, two differ:
+
+loadState(emergencyId: string) — correct, no change.
+broadcast(emergencyId: string, event: string, payload: object) — correct, but it's synchronous (no Promise).
+saveResult(roundId, allocations, explanation) — correct, but only saves allocations, not bids.
+runNegotiationRound(cases, resources) — differs: must return { bids, allocations, explanation }, not just { allocations, explanation }.
+Missing one: add saveBids(roundId: string, bids: Bid[]): Promise<void> — call this before saveResult, since Person B never writes to the DB directly.
+
+Person B needs to update their return type:
+
+runNegotiationRound(cases, resources) must return { bids: Bid[], allocations: Allocation[], explanation: string } instead of just { allocations, explanation }.
+Concretely: whatever step currently produces bid scores/reasoning per resource needs to keep that array around and include it in the final return, rather than discarding it after conflict resolution picks the winners.
+No change to inputs, no change to the fact that it stays a pure function with no DB access.
+
+## Does Person A's SSE currently support agent-bidding negotiation streaming?
+
+**No — not yet, but the transport itself doesn't need to change.** Here's the precise state:
+
+`broadcast(emergencyId, event, payload)` is generic — it can send *any* event type to connected SSE clients. So technically the pipe is capable of carrying `bid_submitted` events right now. But nothing in the currently-built system actually calls `broadcast()` with that event type. Person A's SSE only fires on:
+- `emergency_declared`
+- `case_added`
+- `resource_status_changed`
+
+There's no `bid_submitted` or `round_completed` event anywhere yet, because the code that would trigger those (the negotiation round itself) hasn't been wired to call `broadcast()` — that logic lives in Person B's and Person C's files, not Person A's.
+
+**So: the gap isn't in Person A's SSE implementation — it's that Person B and Person C haven't hooked into it yet.**
+
+### Exact changes needed
+
+**Person A** — no code changes required. Two small non-blocking items:
+1. Document `bid_submitted` and `round_completed` as valid event types clients should expect on the stream (so the frontend person knows what to listen for).
+2. Optional sanity check: fire several `broadcast()` calls back-to-back in a throwaway script and confirm a connected SSE client receives all of them, not just the last one. This simulates several bids arriving in quick succession.
+
+**Person B** — change the function signature to accept and call a streaming callback:
+```typescript
+async function runNegotiationRound(
+  cases: Case[],
+  resources: Resource[],
+  onBid?: (bid: Bid) => void
+): Promise<{ bids: Bid[], allocations: Allocation[], explanation: string }>
+```
+Call `onBid(bid)` the instant *each individual agent's* Groq call resolves — not after `Promise.all` finishes. This is what makes bids appear one-by-one in real time rather than all at once at the end.
+
+**Person C** — wire the callback to the actual broadcast:
+```typescript
+async function triggerRound(emergencyId: string, roundId: string) {
+  const { cases, resources } = await loadState(emergencyId);
+  const { bids, allocations, explanation } = await runNegotiationRound(
+    cases, resources,
+    (bid) => broadcast(emergencyId, 'bid_submitted', bid)
+  );
+  await saveBids(roundId, bids);
+  await saveResult(roundId, allocations, explanation);
+  broadcast(emergencyId, 'round_completed', { roundId, allocations });
+}
+```
+
+---
+
+## Consolidated deliverables + tests, all three people
+
+### Person A — ✅ Done
+**Deliverables:** Supabase schema (7 tables), `loadState`, `saveBids`, `saveResult`, `broadcast` (fake/live toggle), SSE stream with heartbeat, all REST routes, error handling.
+
+**Remaining before integration:** Expose `scope`/`status` on an emergency (Person C needs this to know when to stop the mass-event loop) — via an added field on `GET /emergencies/:id` or a new `getEmergency(emergencyId)` helper.
+
+**Tests to run alone:**
+1. Each REST route returns correct status codes for valid/invalid input (400/404/500 paths).
+2. `saveBids` and `saveResult` correctly persist to Supabase in live mode, and to in-memory arrays in fake mode.
+3. SSE: connect a client, fire several `broadcast()` calls rapidly, confirm all arrive in order, none dropped.
+4. SSE: confirm heartbeat keeps a connection alive past 30s with no data sent.
+5. Confirm `DATA_LAYER=fake` and `DATA_LAYER=live` both work end-to-end for all four core functions.
+
+---
+
+### Person B — Negotiation engine
+**Deliverables:**
+```typescript
+async function runNegotiationRound(
+  cases: Case[],
+  resources: Resource[],
+  onBid?: (bid: Bid) => void
+): Promise<{ bids: Bid[], allocations: Allocation[], explanation: string }>
+```
+- Calls Groq per resource-agent, fires `onBid(bid)` the instant each resolves
+- Checks resource dependencies before validating a bid
+- Resolves contention by highest valid score
+- Calls Mistral once at the end for the explanation
+- Returns `bids`, `allocations`, `explanation` — all three
+- **Zero** Supabase imports or calls, anywhere
+
+**Tests required before handoff (all must pass alone):**
+1. **Streaming order** — fake callback logs each bid as it arrives; confirm they print staggered, not in one burst before the function returns.
+2. **Bid shape** — every bid has exactly `round_id, case_id, resource_id, bid_score, reasoning, conditions` (note: `bid_score`, not `score`).
+3. **Dependency exclusion** — construct a scenario with an unmet dependency (e.g. OR slot, no staff); confirm that bid is excluded from allocations.
+4. **Contention resolution** — two competing bids on the same case/resource; confirm only the higher score wins.
+5. **Individual-pool test** — pool of exactly one case; confirm no crash, correct output.
+6. **Mass-pool test** — 5–10+ cases at once; confirm no case is silently dropped and bids interleave sensibly.
+7. **Isolation check** — search the file for `supabase`; confirm zero matches.
+8. **Non-empty explanation** — confirm `explanation` is always a populated string, even for single-case rounds.
+
+---
+
+### Person C — Orchestration + infra
+**Deliverables:**
+```typescript
+async function triggerRound(emergencyId: string, roundId: string): Promise<void> {
+  const { cases, resources } = await loadState(emergencyId);
+  const { bids, allocations, explanation } = await runNegotiationRound(
+    cases, resources,
+    (bid) => broadcast(emergencyId, 'bid_submitted', bid)
+  );
+  await saveBids(roundId, bids);
+  await saveResult(roundId, allocations, explanation);
+  broadcast(emergencyId, 'round_completed', { roundId, allocations });
+}
+```
+- Redis-based debounce for mass-event re-triggering (short TTL, collapses rapid changes into one round)
+- Individual scope: fires `triggerRound` once
+- Mass scope: loops until emergency status is resolved (needs Person A's `scope`/`status` exposure to know when to stop)
+- No direct Supabase or Groq/Mistral calls anywhere — only the four imported functions
+
+**Tests required before handoff (all must pass alone, against stubs/Redis):**
+1. **Stub wiring** — local stub `runNegotiationRound` calls `onBid` a few times then resolves; confirm `triggerRound` calls everything in correct order.
+2. **Event ordering** — confirm multiple `bid_submitted` broadcasts fire before exactly one `round_completed`, never reversed, never duplicated.
+3. **Individual-scope** — confirm `triggerRound` fires exactly once, no looping.
+4. **Mass-scope debounce** (against real Upstash) — fire several rapid trigger-eligible events within the TTL window; confirm only one round actually executes.
+5. **Mass-scope repeat/stop** — confirm the loop keeps firing while unresolved, and stops once status flips to resolved.
+6. **Isolation check** — search the file for direct Supabase or Groq/Mistral usage; confirm zero matches.
+
+---
+
+## What happens only after all of the above pass individually
+Only once Person B's 8 tests and Person C's 6 tests each pass **alone** do the zips get exchanged, merged by one designated integration point person, and the combined local test (fake → mass scenario → live → single git push → deployed smoke test) begins — per the sequence already laid out earlier.
+
+
+# Frontend Content Spec — Emergency Resource Negotiation Platform
+
+This document lists every page in the product and the exact content to display on
+each — headings, copy, labels, empty states, and data fields. It is written so the
+frontend person can build against it without needing to read the backend docs.
+
+Realtime pages (marked ⚡) consume the SSE stream at
+`GET /emergencies/:id/stream`. Everything else is REST-only.
+
+---
+
+## 1. Login Page
+
+**Route:** `/login`
+
+- Page title: `Sign in`
+- Subtext: `Hospital resource coordination platform`
+- Fields: `Email`, `Password`
+- Primary button: `Sign in`
+- Secondary link: `Forgot password?`
+- Error state (bad credentials): `Incorrect email or password. Please try again.`
+- Error state (network failure): `Couldn't reach the server. Check your connection and try again.`
+
+*For a 4-hour MVP this page can be skipped entirely with a hardcoded session — if
+skipped, note it isn't a design gap, it's a deliberate scope cut.*
+
+---
+
+## 2. Dashboard (Home) ⚡
+
+**Route:** `/dashboard`
+
+This is the landing page after login — a bird's-eye view of every emergency, active
+or resolved.
+
+- Page title: `Emergency Overview`
+- Top summary cards (4 across):
+  - `Active Emergencies` — count, red accent if > 0
+  - `Pending Cases` — count across all active emergencies
+  - `Resources Contested` — count of resources with more than one bid in the current round
+  - `Avg. Time to Allocation` — rolling average, e.g. `4.2s`
+- Primary button, top right: `Declare Emergency`
+- List of emergencies, each row showing:
+  - Scope badge: `Individual` (blue) or `Mass Casualty` (red)
+  - Status badge: `Active` (pulsing dot) or `Resolved` (grey)
+  - Department reach: comma list, e.g. `ER, ICU, Surgery`
+  - Declared time: relative, e.g. `12 minutes ago`
+  - Click target → `View Negotiation`
+- Empty state (no emergencies at all): headline `No active emergencies` / subtext
+  `Your hospital's resources are fully available. Declared emergencies will appear here.`
+
+---
+
+## 3. Declare Emergency (Modal or Page)
+
+**Route:** `/emergencies/new`
+
+- Title: `Declare Emergency`
+- Field: `Scope` — radio/segmented control: `Individual Patient` / `Mass Casualty Event`
+- Field: `Departments Affected` — multi-select: `Emergency`, `ICU`, `Surgery`,
+  `Radiology`, `Staffing`, `Equipment`
+- Helper text under scope selector:
+  - Individual: `A single urgent case. The system will run one negotiation round and resolve immediately.`
+  - Mass Casualty: `Multiple cases arriving over time. The system will continuously re-negotiate as new cases and resources change.`
+- Primary button: `Declare and Open Negotiation`
+- Cancel button: `Cancel`
+- Validation error: `Select at least one affected department.`
+
+---
+
+## 4. Live Negotiation Feed ⚡ — the centerpiece page
+
+**Route:** `/emergencies/:id`
+
+This is the page judges will spend the most time on. It has to visibly tell the
+story of agents bidding, scores updating, conflicts resolving, and a final
+explainable decision — live, without a refresh.
+
+### 4.1 Header bar
+- Emergency scope badge + status badge (same as dashboard)
+- `Declared 6 minutes ago` (relative time, live-updating)
+- Departments involved, as chips
+- Button: `Resolve Emergency` (only visible/enabled once no pending cases remain)
+
+### 4.2 Case Queue panel (left column)
+- Section title: `Pending Cases (N)`
+- Each case card:
+  - Acuity badge, color-coded: 1–2 green (`Low`), 3 yellow (`Moderate`), 4–5 red (`Critical`)
+  - Required resource types, as small tags: `ICU Bed`, `Surgeon`, `OR Slot`
+  - Status: `Pending` / `Negotiating` / `Allocated`
+  - When status flips to `Negotiating`, the card gets a subtle pulsing border —
+    this is the visual cue that agents are actively bidding on it right now
+- Empty state: `No pending cases. All patients have been allocated resources.`
+
+### 4.3 Live Negotiation Panel (center — the main event)
+
+This is the part that needs the most attention. It should feel like watching a
+negotiation happen, not reading a static log.
+
+- Section title: `Negotiation Round #N` with a small `● LIVE` indicator while a
+  round is in progress, replaced by `✓ Resolved` once `round_completed` fires
+- As each `bid_submitted` event arrives, append a **bid card** to a live-updating
+  list (newest at top, or a horizontally scrolling timeline — either works):
+  - Resource name + type icon, e.g. `🛏 ICU Bed 4` or `🔪 OR Slot 2`
+  - Bid score, shown as a large number and a filled bar, e.g. `87/100`
+  - One-line reasoning, directly from the agent's response, e.g.
+    `High acuity match, no dependency conflicts`
+  - Conditions, if any, as small warning-colored tags, e.g. `⚠ Requires anesthesiologist transfer`
+  - Case it's bidding on, as a small reference chip, e.g. `→ Case #C-104`
+  - Each new card animates in (slide/fade) rather than appearing instantly —
+    this is what makes it *read* as live rather than a static table
+- Once `round_completed` arrives, the winning bid(s) get visually highlighted
+  (e.g. green border, a `WON` badge) and losing bids for the same case dim
+  slightly but stay visible — this is the "explainability" the problem
+  statement asks for: judges should be able to see not just what was decided,
+  but what was considered and rejected.
+- Below the feed, a rolling text line updates per round:
+  `Round 4: reprioritized due to new trauma arrival` — this is the "situation
+  report" framing discussed for mass events, giving continuity across rounds
+  rather than each round feeling disconnected from the last.
+
+### 4.4 Explanation Panel (below or beside the feed)
+- Section title: `Why this decision`
+- Body: the plain-language explanation string from the round (Mistral-generated),
+  rendered as prose, not bullet points — this should read like something a human
+  administrator wrote
+- Small metadata line under it: `Generated in 1.2s · Round #4 · 3 resources considered`
+
+### 4.5 Resource Status panel (right column)
+- Section title: `Resource Availability`
+- Grouped by department, each resource shown as a compact row:
+  - Status dot: green (`Available`), amber (`Reserved`), red (`Occupied`), grey (`Offline`)
+  - Resource label, e.g. `OR Slot 3`
+  - If contested this round: small `⚔ Contested` tag
+  - Manual override affordance (small `⋯` menu): `Mark Offline`, `Mark Available`
+    — this is the human-override path a real admin needs, and doubles as a good
+    "look, a human can always step in" talking point for judges
+
+### 4.6 Empty / waiting states
+- Before any round has started: `Waiting for negotiation to begin...` with a
+  subtle loading pulse
+- If a round is taking unusually long (e.g. > 8s): `Still negotiating — this can
+  take a few seconds for complex cases.` (prevents it looking frozen/broken)
+
+---
+
+## 5. Round Detail / History Page
+
+**Route:** `/emergencies/:id/rounds/:roundId`
+
+For reviewing a past round after the fact — not live, pulled via REST
+(`GET /emergencies/:id/rounds/:roundId`).
+
+- Title: `Round #N — [timestamp]`
+- Full list of bids (same card style as the live feed, but static, no animation)
+- Final allocations, clearly marked
+- Full explanation text
+- Button: `Back to Negotiation`
+
+---
+
+## 6. Audit Log Page
+
+**Route:** `/audit-log`
+
+- Title: `Audit Trail`
+- Subtext: `A tamper-evident record of every decision made by the system.`
+- Table columns: `Timestamp`, `Event Type`, `Summary`, `Hash`
+  - Event type shown as a tag: `Allocation`, `Emergency Declared`, `Resource Override`, `Case Added`
+  - `Hash` column shows a truncated hash (e.g. `a3f9…21c`) with a tooltip/expand
+    showing the full chain link to the previous entry — this is what visually
+    sells "tamper-evident" to judges without needing them to understand SHA-256
+- Pagination controls: `Previous` / `Next`, showing `Page X of Y`
+- Empty state: `No audit events yet.`
+
+---
+
+## 7. Resource Management Page
+
+**Route:** `/resources`
+
+- Title: `All Resources`
+- Filter chips at top: `All`, `OR Slots`, `ICU Beds`, `Staff`, `Equipment`, `ER Bays`
+- Table or card grid, each entry:
+  - Name/label
+  - Type icon
+  - Department
+  - Status dot + label
+  - Dependencies, if any: `Requires: Surgeon (Dr. Lin), Recovery Bed`
+  - `Edit Status` action
+- Empty state: `No resources configured.`
+
+---
+
+## 8. Settings Page
+
+**Route:** `/settings`
+
+- Title: `Settings`
+- Section: `Account`
+  - Name, email (read-only for MVP)
+  - `Log out` button
+- Section: `Notifications`
+  - Toggle: `Notify me when a new emergency is declared`
+  - Toggle: `Notify me when a resource becomes contested`
+- Section: `Display`
+  - Toggle: `Reduce motion` — disables the bid-card slide-in animations, worth
+    including since the live feed is animation-heavy and some users/judges may
+    prefer a calmer view
+- Section: `About`
+  - Version number, e.g. `v0.1.0 (MVP)`
+  - Link: `View documentation`
+
+*For a 4-hour build, this entire page can be a single static screen with no
+working toggles — the presence of the page matters more than functionality here.*
+
+---
+
+## 9. Error / Fallback States (global, not a page)
+
+- Connection lost banner (SSE disconnects): `Live updates paused — reconnecting...`
+  with an automatic retry; once reconnected: `Back online` (auto-dismiss after 3s)
+- 404 page: `Page not found` / `That emergency or resource doesn't exist.` /
+  button `Back to Dashboard`
+- 500 / generic error boundary: `Something went wrong.` / `Try refreshing the page.`
+  — never show raw error text or stack traces to the user
+
+---
+
+## 10. Shared Components Reference
+
+These appear across multiple pages — build once, reuse everywhere.
+
+| Component | Used on | Key content |
+|---|---|---|
+| Scope badge | Dashboard, Negotiation page | `Individual` / `Mass Casualty` |
+| Status dot | Resources, Dashboard | green/amber/red/grey, with label on hover |
+| Acuity badge | Case cards | 1–5 scale, color-coded |
+| Bid card | Live feed, Round detail | score, reasoning, conditions, case ref |
+| Explanation block | Live feed, Round detail | prose text + metadata line |
+| Empty state | All list pages | headline + one-line subtext, no images needed |
+
+---
+
+## Priority order if time runs short
+
+If the frontend build has to cut scope under time pressure, cut in this order
+(last item cut first):
+
+1. Settings page → static, non-functional
+2. Round history/detail page → skip, rely on the live feed being seen once
+3. Audit log → simple table, skip the hash-chain tooltip
+4. Resource management page → fold into a read-only panel on the dashboard
+5. **Never cut:** the Live Negotiation Feed (§4) — this is the actual demo.
+   Everything else is supporting cast.
+
+
+   # Frontend Content Spec — Emergency Resource Negotiation Platform
+
+This document lists every page in the product and the exact content to display on
+each — headings, copy, labels, empty states, and data fields. It is written so the
+frontend person can build against it without needing to read the backend docs.
+
+Realtime pages (marked ⚡) consume the SSE stream at
+`GET /emergencies/:id/stream`. Everything else is REST-only.
+
+---
+
+## 1. Login Page
+
+**Route:** `/login`
+
+- Page title: `Sign in`
+- Subtext: `Hospital resource coordination platform`
+- Fields: `Email`, `Password`
+- Primary button: `Sign in`
+- Secondary link: `Forgot password?`
+- Error state (bad credentials): `Incorrect email or password. Please try again.`
+- Error state (network failure): `Couldn't reach the server. Check your connection and try again.`
+
+*For a 4-hour MVP this page can be skipped entirely with a hardcoded session — if
+skipped, note it isn't a design gap, it's a deliberate scope cut.*
+
+---
+
+## 2. Dashboard (Home) ⚡
+
+**Route:** `/dashboard`
+
+This is the landing page after login — a bird's-eye view of every emergency, active
+or resolved.
+
+- Page title: `Emergency Overview`
+- Top summary cards (4 across):
+  - `Active Emergencies` — count, red accent if > 0
+  - `Pending Cases` — count across all active emergencies
+  - `Resources Contested` — count of resources with more than one bid in the current round
+  - `Avg. Time to Allocation` — rolling average, e.g. `4.2s`
+- Primary button, top right: `Declare Emergency`
+- List of emergencies, each row showing:
+  - Scope badge: `Individual` (blue) or `Mass Casualty` (red)
+  - Status badge: `Active` (pulsing dot) or `Resolved` (grey)
+  - Department reach: comma list, e.g. `ER, ICU, Surgery`
+  - Declared time: relative, e.g. `12 minutes ago`
+  - Click target → `View Negotiation`
+- Empty state (no emergencies at all): headline `No active emergencies` / subtext
+  `Your hospital's resources are fully available. Declared emergencies will appear here.`
+
+---
+
+## 3. Declare Emergency (Modal or Page)
+
+**Route:** `/emergencies/new`
+
+- Title: `Declare Emergency`
+- Field: `Scope` — radio/segmented control: `Individual Patient` / `Mass Casualty Event`
+- Field: `Departments Affected` — multi-select: `Emergency`, `ICU`, `Surgery`,
+  `Radiology`, `Staffing`, `Equipment`
+- Helper text under scope selector:
+  - Individual: `A single urgent case. The system will run one negotiation round and resolve immediately.`
+  - Mass Casualty: `Multiple cases arriving over time. The system will continuously re-negotiate as new cases and resources change.`
+- Primary button: `Declare and Open Negotiation`
+- Cancel button: `Cancel`
+- Validation error: `Select at least one affected department.`
+
+---
+
+## 4. Live Negotiation Feed ⚡ — the centerpiece page
+
+**Route:** `/emergencies/:id`
+
+This is the page judges will spend the most time on. It has to visibly tell the
+story of agents bidding, scores updating, conflicts resolving, and a final
+explainable decision — live, without a refresh.
+
+### 4.1 Header bar
+- Emergency scope badge + status badge (same as dashboard)
+- `Declared 6 minutes ago` (relative time, live-updating)
+- Departments involved, as chips
+- Button: `Resolve Emergency` (only visible/enabled once no pending cases remain)
+
+### 4.2 Case Queue panel (left column)
+- Section title: `Pending Cases (N)`
+- Each case card:
+  - Acuity badge, color-coded: 1–2 green (`Low`), 3 yellow (`Moderate`), 4–5 red (`Critical`)
+  - Required resource types, as small tags: `ICU Bed`, `Surgeon`, `OR Slot`
+  - Status: `Pending` / `Negotiating` / `Allocated`
+  - When status flips to `Negotiating`, the card gets a subtle pulsing border —
+    this is the visual cue that agents are actively bidding on it right now
+- Empty state: `No pending cases. All patients have been allocated resources.`
+
+### 4.3 Live Negotiation Panel (center — the main event)
+
+This is the part that needs the most attention. It should feel like watching a
+negotiation happen, not reading a static log.
+
+- Section title: `Negotiation Round #N` with a small `● LIVE` indicator while a
+  round is in progress, replaced by `✓ Resolved` once `round_completed` fires
+- As each `bid_submitted` event arrives, append a **bid card** to a live-updating
+  list (newest at top, or a horizontally scrolling timeline — either works):
+  - Resource name + type icon, e.g. `🛏 ICU Bed 4` or `🔪 OR Slot 2`
+  - Bid score, shown as a large number and a filled bar, e.g. `87/100`
+  - One-line reasoning, directly from the agent's response, e.g.
+    `High acuity match, no dependency conflicts`
+  - Conditions, if any, as small warning-colored tags, e.g. `⚠ Requires anesthesiologist transfer`
+  - Case it's bidding on, as a small reference chip, e.g. `→ Case #C-104`
+  - Each new card animates in (slide/fade) rather than appearing instantly —
+    this is what makes it *read* as live rather than a static table
+- Once `round_completed` arrives, the winning bid(s) get visually highlighted
+  (e.g. green border, a `WON` badge) and losing bids for the same case dim
+  slightly but stay visible — this is the "explainability" the problem
+  statement asks for: judges should be able to see not just what was decided,
+  but what was considered and rejected.
+- Below the feed, a rolling text line updates per round:
+  `Round 4: reprioritized due to new trauma arrival` — this is the "situation
+  report" framing discussed for mass events, giving continuity across rounds
+  rather than each round feeling disconnected from the last.
+
+### 4.4 Explanation Panel (below or beside the feed)
+- Section title: `Why this decision`
+- Body: the plain-language explanation string from the round (Mistral-generated),
+  rendered as prose, not bullet points — this should read like something a human
+  administrator wrote
+- Small metadata line under it: `Generated in 1.2s · Round #4 · 3 resources considered`
+
+### 4.5 Resource Status panel (right column)
+- Section title: `Resource Availability`
+- Grouped by department, each resource shown as a compact row:
+  - Status dot: green (`Available`), amber (`Reserved`), red (`Occupied`), grey (`Offline`)
+  - Resource label, e.g. `OR Slot 3`
+  - If contested this round: small `⚔ Contested` tag
+  - Manual override affordance (small `⋯` menu): `Mark Offline`, `Mark Available`
+    — this is the human-override path a real admin needs, and doubles as a good
+    "look, a human can always step in" talking point for judges
+
+### 4.6 Empty / waiting states
+- Before any round has started: `Waiting for negotiation to begin...` with a
+  subtle loading pulse
+- If a round is taking unusually long (e.g. > 8s): `Still negotiating — this can
+  take a few seconds for complex cases.` (prevents it looking frozen/broken)
+
+---
+
+## 5. Round Detail / History Page
+
+**Route:** `/emergencies/:id/rounds/:roundId`
+
+For reviewing a past round after the fact — not live, pulled via REST
+(`GET /emergencies/:id/rounds/:roundId`).
+
+- Title: `Round #N — [timestamp]`
+- Full list of bids (same card style as the live feed, but static, no animation)
+- Final allocations, clearly marked
+- Full explanation text
+- Button: `Back to Negotiation`
+
+---
+
+## 6. Audit Log Page
+
+**Route:** `/audit-log`
+
+- Title: `Audit Trail`
+- Subtext: `A tamper-evident record of every decision made by the system.`
+- Table columns: `Timestamp`, `Event Type`, `Summary`, `Hash`
+  - Event type shown as a tag: `Allocation`, `Emergency Declared`, `Resource Override`, `Case Added`
+  - `Hash` column shows a truncated hash (e.g. `a3f9…21c`) with a tooltip/expand
+    showing the full chain link to the previous entry — this is what visually
+    sells "tamper-evident" to judges without needing them to understand SHA-256
+- Pagination controls: `Previous` / `Next`, showing `Page X of Y`
+- Empty state: `No audit events yet.`
+
+---
+
+## 7. Resource Management Page
+
+**Route:** `/resources`
+
+- Title: `All Resources`
+- Filter chips at top: `All`, `OR Slots`, `ICU Beds`, `Staff`, `Equipment`, `ER Bays`
+- Table or card grid, each entry:
+  - Name/label
+  - Type icon
+  - Department
+  - Status dot + label
+  - Dependencies, if any: `Requires: Surgeon (Dr. Lin), Recovery Bed`
+  - `Edit Status` action
+- Empty state: `No resources configured.`
+
+---
+
+## 8. Settings Page
+
+**Route:** `/settings`
+
+- Title: `Settings`
+- Section: `Account`
+  - Name, email (read-only for MVP)
+  - `Log out` button
+- Section: `Notifications`
+  - Toggle: `Notify me when a new emergency is declared`
+  - Toggle: `Notify me when a resource becomes contested`
+- Section: `Display`
+  - Toggle: `Reduce motion` — disables the bid-card slide-in animations, worth
+    including since the live feed is animation-heavy and some users/judges may
+    prefer a calmer view
+- Section: `About`
+  - Version number, e.g. `v0.1.0 (MVP)`
+  - Link: `View documentation`
+
+*For a 4-hour build, this entire page can be a single static screen with no
+working toggles — the presence of the page matters more than functionality here.*
+
+---
+
+## 9. Error / Fallback States (global, not a page)
+
+- Connection lost banner (SSE disconnects): `Live updates paused — reconnecting...`
+  with an automatic retry; once reconnected: `Back online` (auto-dismiss after 3s)
+- 404 page: `Page not found` / `That emergency or resource doesn't exist.` /
+  button `Back to Dashboard`
+- 500 / generic error boundary: `Something went wrong.` / `Try refreshing the page.`
+  — never show raw error text or stack traces to the user
+
+---
+
+## 10. Shared Components Reference
+
+These appear across multiple pages — build once, reuse everywhere.
+
+| Component | Used on | Key content |
+|---|---|---|
+| Scope badge | Dashboard, Negotiation page | `Individual` / `Mass Casualty` |
+| Status dot | Resources, Dashboard | green/amber/red/grey, with label on hover |
+| Acuity badge | Case cards | 1–5 scale, color-coded |
+| Bid card | Live feed, Round detail | score, reasoning, conditions, case ref |
+| Explanation block | Live feed, Round detail | prose text + metadata line |
+| Empty state | All list pages | headline + one-line subtext, no images needed |
+
+---
+
+## Priority order if time runs short
+
+If the frontend build has to cut scope under time pressure, cut in this order
+(last item cut first):
+
+1. Settings page → static, non-functional
+2. Round history/detail page → skip, rely on the live feed being seen once
+3. Audit log → simple table, skip the hash-chain tooltip
+4. Resource management page → fold into a read-only panel on the dashboard
+5. **Never cut:** the Live Negotiation Feed (§4) — this is the actual demo.
+   Everything else is supporting cast.

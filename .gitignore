@@ -1,0 +1,17 @@
+# Python Virtual Environment
+.venv/
+__pycache__/
+
+# Node / TypeScript dependencies & builds
+node_modules/
+dist/
+person_b_engine/node_modules/
+person_b_engine/dist/
+
+# Local Environment Secrets
+.env
+person_b_engine/.env
+
+# Logs and system files
+*.log
+.DS_Store
